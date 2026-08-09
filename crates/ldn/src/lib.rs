@@ -38,37 +38,29 @@ use anyhow::Context;
 mod generated;
 pub mod winusb;
 
-pub enum Backend {
-	Lkl(LklBackend),
+pub enum Mode {
+	Lkl(Lkl),
 	#[cfg(target_os = "linux")]
 	Linux,
 }
 
-impl Backend {
-	// pub async fn shutdown_signal(&self) {
-	// 	match self {
-	// 		Backend::Lkl(lkl_backend) => {
-	// 			lkl_backend.inner.shutdown.listen().await;
-	// 		}
-	// 	}
-	// }
-
+impl Mode {
 	pub async fn shutdown(&self) -> anyhow::Result<()> {
 		match self {
-			Backend::Lkl(lkl_backend) => {
-				// lkl_backend.inner.shutdown.notify(usize::MAX);
-				lkl_backend.shutdown().await?;
+			Self::Lkl(lkl) => {
+				lkl.shutdown().await?;
 
 				Ok(())
 			}
 		}
 	}
 
+	#[must_use]
 	pub fn logs(&self) -> tokio::sync::broadcast::Receiver<String> {
 		match self {
-			Backend::Lkl(lkl_backend) => {
+			Self::Lkl(lkl) => {
 				//
-				lkl_backend.inner.logs.subscribe()
+				lkl.inner.logs.subscribe()
 			}
 		}
 	}
@@ -79,7 +71,7 @@ struct OwnedWinUsb {
 }
 
 impl OwnedWinUsb {
-	pub fn new(interface: WINUSB_INTERFACE_HANDLE) -> Self {
+	pub const fn new(interface: WINUSB_INTERFACE_HANDLE) -> Self {
 		Self { interface }
 	}
 }
@@ -109,11 +101,12 @@ struct LklInner {
 unsafe impl Send for LklInner {}
 unsafe impl Sync for LklInner {}
 
-pub struct LklBackend {
+pub struct Lkl {
 	inner: Arc<LklInner>,
 }
 
-impl LklBackend {
+impl Lkl {
+	#[must_use]
 	pub fn new(handle: Handle) -> Self {
 		let (tx, _) = tokio::sync::broadcast::channel(100);
 
@@ -131,15 +124,15 @@ impl LklBackend {
 		anyhow::ensure!(self.inner.lkl_ctx.get().is_some());
 
 		let mut v = Vec::<&'static str>::new();
-		let v_ptr = &mut v as *mut Vec<&'static str>;
+		let v_ptr = &raw mut v;
 		unsafe {
 			ldn_lkl_find_driver(
 				*self.inner.lkl_ctx.get().unwrap(),
-				device.vid as _,
-				device.pid as _,
+				device.vid.into(),
+				device.pid.into(),
 				Some(firmware_vec_string_add),
-				v_ptr as *mut c_void,
-			)
+				v_ptr.cast::<c_void>(),
+			);
 		};
 
 		Ok(v)
@@ -236,7 +229,7 @@ impl LklBackend {
 
 		tokio::task::spawn_blocking(move || {
 			let device_path = CString::new(device.path.as_str())?;
-			let device_path = PCSTR::from_raw(device_path.as_ptr() as _);
+			let device_path = PCSTR::from_raw(device_path.as_ptr().cast());
 
 			let handle = unsafe {
 				CreateFileA(
@@ -265,22 +258,22 @@ impl LklBackend {
 			}?;
 
 			let mut interface_handle = WINUSB_INTERFACE_HANDLE::default();
-			unsafe { WinUsb_Initialize(*handle, &mut interface_handle) }?;
+			unsafe { WinUsb_Initialize(*handle, &raw mut interface_handle) }?;
 
 			let interface_handle = OwnedWinUsb::new(interface_handle);
 
 			let mut interface = USB_INTERFACE_DESCRIPTOR::default();
-			unsafe { WinUsb_QueryInterfaceSettings(*interface_handle, 0, &mut interface) }?;
+			unsafe { WinUsb_QueryInterfaceSettings(*interface_handle, 0, &raw mut interface) }?;
 
 			const LDN_USB_TIMEOUT_MS: usize = 1000;
 			// const LDN_USB_RX_TIMEOUT_MS: usize = 250;
 
 			const LDN_USB_TIMEOUT_MS_PTR: *const std::ffi::c_void =
-				((&LDN_USB_TIMEOUT_MS) as *const usize) as *const std::ffi::c_void;
+				std::ptr::from_ref::<usize>(&LDN_USB_TIMEOUT_MS).cast::<std::ffi::c_void>();
 
 			const YES: bool = true;
 			const YES_PTR: *const std::ffi::c_void =
-				((&YES) as *const bool) as *const std::ffi::c_void;
+				std::ptr::from_ref::<bool>(&YES).cast::<std::ffi::c_void>();
 
 			unsafe {
 				WinUsb_SetPipePolicy(
@@ -294,7 +287,8 @@ impl LklBackend {
 
 			for i in 0..interface.bNumEndpoints {
 				let mut pipe_info = WINUSB_PIPE_INFORMATION::default();
-				if let Err(_) = unsafe { WinUsb_QueryPipe(*interface_handle, 0, i, &mut pipe_info) }
+				if let Err(_) =
+					unsafe { WinUsb_QueryPipe(*interface_handle, 0, i, &raw mut pipe_info) }
 				{
 					continue;
 				}
@@ -322,7 +316,7 @@ impl LklBackend {
 				}?;
 			}
 
-			if let Err(_) = inner.device.set(device) {
+			if inner.device.set(device).is_err() {
 				anyhow::bail!("device already set")
 			}
 
@@ -338,12 +332,12 @@ impl LklBackend {
 			let userdata = Arc::into_raw(userdata);
 
 			let mut ctx: *mut c_void = null_mut();
-			let ret = unsafe { ldn_lkl_init(&mut ctx, userdata as *mut c_void) };
+			let ret = unsafe { ldn_lkl_init(&raw mut ctx, userdata as *mut c_void) };
 			if ret != 0 {
 				anyhow::bail!("lkl init failed {}", ret);
 			}
 
-			if let Err(_) = inner.lkl_ctx.set(ctx) {
+			if inner.lkl_ctx.set(ctx).is_err() {
 				anyhow::bail!("Context already set");
 			}
 
@@ -360,26 +354,26 @@ impl LklBackend {
 }
 
 #[unsafe(no_mangle)]
+#[allow(clippy::cast_sign_loss, clippy::as_conversions)]
 pub extern "C" fn impl_ldn_lkl_print(
 	str_: *const ::std::os::raw::c_char,
 	len: i32,
 	userdata: *mut ::std::os::raw::c_void,
 ) {
-	let userdata = unsafe { &mut *(userdata as *mut LklInner) };
+	let userdata = unsafe { &mut *userdata.cast::<LklInner>() };
 
-	let s = unsafe { slice::from_raw_parts(str_ as *const std::os::raw::c_uchar, len as _) };
+	let s = unsafe { slice::from_raw_parts(str_.cast::<std::os::raw::c_uchar>(), len as usize) };
 	let s = unsafe { str::from_utf8_unchecked(s) };
 
 	let _ = userdata.logs.send(s.to_string());
-
-	// print!("lkl: {}", s);
 }
 
+#[allow(clippy::all)]
 unsafe extern "C" fn firmware_vec_string_add(
 	fw: *const ::std::os::raw::c_char,
 	userdata: *mut ::std::os::raw::c_void,
 ) {
-	let v = unsafe { &mut *(userdata as *mut Vec<&'static str>) };
+	let v = unsafe { &mut *userdata.cast::<Vec<&'static str>>() };
 
 	let s = unsafe { CStr::from_ptr::<'static>(fw) };
 

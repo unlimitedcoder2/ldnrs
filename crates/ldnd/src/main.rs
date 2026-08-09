@@ -1,5 +1,5 @@
-use ldn::{Backend, LklBackend, winusb};
-use tokio::signal::ctrl_c;
+use ldn::{Lkl, Mode, winusb};
+use tokio::{io::AsyncReadExt, net::windows::named_pipe::ServerOptions, signal::ctrl_c};
 
 #[derive(Debug, Default, Clone)]
 struct Args {
@@ -41,8 +41,17 @@ async fn main() -> anyhow::Result<()> {
 					.ok_or_else(|| anyhow::anyhow!("no socket argument after --socket"))?;
 				args.socket = socket;
 			}
-			"--backend" => {
+			"--mode" => {
 				anyhow::bail!("TODO")
+			}
+
+			"--log-devices" => {
+				let usb_devices = winusb::get_devices()?;
+				for dev in &usb_devices {
+					println!("{:?}", dev);
+				}
+
+				return Ok(());
 			}
 
 			_ => {
@@ -62,16 +71,14 @@ async fn main() -> anyhow::Result<()> {
 	let usb_devices = winusb::get_devices()?;
 	let device = usb_devices
 		.into_iter()
-		.find(|d| {
-			return d.vid == args.vid && d.pid == args.pid;
-		})
+		.find(|d| d.vid == args.vid && d.pid == args.pid)
 		.ok_or_else(|| anyhow::anyhow!("Selected device not found"))?;
 
 	let handle = tokio::runtime::Handle::current();
-	let backend = LklBackend::new(handle);
-	let mut backend = Backend::Lkl(backend);
+	let lkl = Lkl::new(handle);
+	let mut mode = Mode::Lkl(lkl);
 
-	let mut logs = backend.logs();
+	let mut logs = mode.logs();
 
 	let _ = tokio::spawn(async move {
 		while let Ok(msg) = logs.recv().await {
@@ -81,20 +88,51 @@ async fn main() -> anyhow::Result<()> {
 
 	let client = wrest::Client::builder().build()?;
 
-	match &mut backend {
-		Backend::Lkl(lkl_backend) => {
-			lkl_backend.init().await?;
-			lkl_backend.download_firmware(&device, &client).await?;
-			lkl_backend.attach(device).await?;
+	match &mut mode {
+		Mode::Lkl(lkl) => {
+			lkl.init().await?;
+			lkl.download_firmware(&device, &client).await?;
+			lkl.attach(device).await?;
 		}
 	}
+
+	// TODO: Unix socket on linux/bsd/macosx
+	let opts = ServerOptions::new();
+	let mut server = opts.create(args.socket)?;
+
+	tokio::spawn(async move {
+		loop {
+			if let Err(e) = server.connect().await {
+				println!("Failed to accept named pipe connection {}", e);
+				continue;
+			}
+
+			let mut buf = vec![0u8; 4096];
+			loop {
+				match server.read(&mut buf).await {
+					Ok(n) => {
+						println!("Read {} bytes", n);
+						continue;
+					}
+					Err(e) => {
+						println!("Failed to read from named pipe {}", e);
+						break;
+					}
+				}
+			}
+
+			if let Err(e) = server.disconnect() {
+				println!("Failed to disconnect client {}", e);
+			}
+		}
+	});
 
 	let ctrlc = ctrl_c();
 	tokio::select! {
 		res = ctrlc => {
 			res?;
 			println!("Ctrl-c detected, stopping");
-			backend.shutdown().await?;
+			mode.shutdown().await?;
 			return Ok(());
 		},
 	}

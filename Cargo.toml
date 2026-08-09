@@ -5,7 +5,7 @@ members = ["crates/ldn", "crates/wingui", "crates/ldnd"]
 [workspace.dependencies]
 ldn = { path = "./crates/ldn" }
 anyhow = { version = "1.0.104", features = ["backtrace"] }
-tokio = { version = "1.53.1", features = ["macros", "fs", "signal", "io-util", "rt-multi-thread", "sync"] }
+tokio = { version = "1.53.1", features = ["macros", "fs", "signal", "io-util", "rt-multi-thread", "sync", "net"] }
 wrest = "0.5.7"
 
 [profile.release]

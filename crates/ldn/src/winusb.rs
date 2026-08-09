@@ -25,6 +25,7 @@ pub struct UsbDevice {
 const VID: [u16; 4] = [0x0076, 0x0069, 0x0064, 0x005f];
 const PID: [u16; 4] = [0x0070, 0x0069, 0x0064, 0x005f];
 
+#[must_use]
 pub fn find_vidpid(s: &[u16]) -> (u16, u16) {
 	let mut vid: u16 = 0;
 	let mut pid: u16 = 0;
@@ -37,7 +38,7 @@ pub fn find_vidpid(s: &[u16]) -> (u16, u16) {
 		}
 
 		let key = &s[i..i + 4];
-		if key != &VID && key != &PID {
+		if key != VID && key != PID {
 			i += 1;
 			continue;
 		}
@@ -45,7 +46,7 @@ pub fn find_vidpid(s: &[u16]) -> (u16, u16) {
 		let mut buf = [0u8; 4];
 		for x in 0..buf.len() {
 			let item = s[i + 4 + x];
-			if item > u8::MAX as _ {
+			if item > u8::MAX.into() {
 				return (0, 0);
 			}
 			buf[x] = item as _;
@@ -57,7 +58,7 @@ pub fn find_vidpid(s: &[u16]) -> (u16, u16) {
 			Err(_) => return (0, 0),
 		};
 
-		if key == &VID {
+		if key == VID {
 			vid = v;
 		} else {
 			pid = v;
@@ -79,7 +80,7 @@ fn get_interface_detail(
 ) -> anyhow::Result<(Vec<u16>, SP_DEVINFO_DATA)> {
 	let mut needed: u32 = 0;
 	let r = unsafe {
-		SetupDiGetDeviceInterfaceDetailW(dev_info, interface, None, 0, Some(&mut needed), None)
+		SetupDiGetDeviceInterfaceDetailW(dev_info, interface, None, 0, Some(&raw mut needed), None)
 	};
 
 	if let Err(e) = r
@@ -90,7 +91,7 @@ fn get_interface_detail(
 
 	// TODO: We could stack allocate if its small
 	let mut buf = vec![0u32; needed as usize];
-	let detail_ptr = buf.as_mut_ptr() as *mut SP_DEVICE_INTERFACE_DETAIL_DATA_W;
+	let detail_ptr = buf.as_mut_ptr().cast::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>();
 	unsafe {
 		(*detail_ptr).cbSize = if cfg!(target_pointer_width = "64") {
 			8
@@ -111,7 +112,7 @@ fn get_interface_detail(
 			Some(detail_ptr),
 			needed,
 			None,
-			Some(&mut owner),
+			Some(&raw mut owner),
 		)
 	}?;
 
@@ -132,17 +133,24 @@ fn get_prop_str(
 	let mut req_bufsize: u32 = 0;
 
 	let r = unsafe {
-		SetupDiGetDeviceRegistryPropertyW(dev_info, data, prop, None, None, Some(&mut req_bufsize))
+		SetupDiGetDeviceRegistryPropertyW(
+			dev_info,
+			data,
+			prop,
+			None,
+			None,
+			Some(&raw mut req_bufsize),
+		)
 	};
 
-	if let Err(e) = r {
-		if e.code() != ERROR_INSUFFICIENT_BUFFER.into() {
-			if e.code() == ERROR_INVALID_DATA.into() {
-				return Ok(None);
-			}
-
-			return Err(e.into());
+	if let Err(e) = r
+		&& e.code() != ERROR_INSUFFICIENT_BUFFER.into()
+	{
+		if e.code() == ERROR_INVALID_DATA.into() {
+			return Ok(None);
 		}
+
+		return Err(e.into());
 	}
 
 	let mut buf = [0u16; 1024];
@@ -158,7 +166,7 @@ fn get_prop_str(
 			prop,
 			None,
 			Some(std::slice::from_raw_parts_mut(
-				buf.as_mut_ptr() as *mut u8,
+				buf.as_mut_ptr().cast::<u8>(),
 				buf.len() * 2,
 			)),
 			None,
@@ -198,7 +206,7 @@ pub fn get_devices() -> anyhow::Result<Vec<UsbDevice>> {
 				None,
 				&GUID_DEVINTERFACE_USB_DEVICE,
 				interface_index,
-				&mut interface,
+				&raw mut interface,
 			)
 		} {
 			if e.code() == ERROR_NO_MORE_ITEMS.into() {
@@ -225,7 +233,6 @@ pub fn get_devices() -> anyhow::Result<Vec<UsbDevice>> {
 
 		if let Some(driver_name) = driver_name
 			&& let Some(device_name) = device_name
-			&& driver_name.eq_ignore_ascii_case("winusb")
 		{
 			let device_path = String::from_utf16(&device_path)?;
 			devices.push(UsbDevice {
