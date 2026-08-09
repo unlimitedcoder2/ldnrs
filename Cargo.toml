@@ -1,0 +1,39 @@
+[workspace]
+resolver = "3"
+members = ["crates/ldn", "crates/wingui", "crates/ldnd"]
+
+[workspace.dependencies]
+ldn = { path = "./crates/ldn" }
+anyhow = { version = "1.0.104", features = ["backtrace"] }
+tokio = { version = "1.53.1", features = ["macros", "fs", "signal", "io-util", "rt-multi-thread", "sync"] }
+wrest = "0.5.7"
+
+[profile.release]
+lto = true
+#opt-level = 2
+codegen-units = 1
+debug = true
+strip = true
+
+# https://www.namtao.com/rust/
+[workspace.lints.clippy]
+manual_range_contains = "allow"
+# UM, ACTUALLY
+pedantic = { level = "deny", priority = -1 }
+# DEVELOPING LINTS
+nursery = { level = "deny", priority = -1 }
+# DENY PANICS
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+unreachable = "deny"
+unimplemented = "deny"
+unchecked_time_subtraction = "deny"
+todo = "deny"
+string_slice = "deny"
+panic_in_result_fn = "deny"
+panic = "deny"
+exit = "deny"
+as_conversions = "deny"
+uninlined_format_args = "allow"
