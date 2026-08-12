@@ -1859,6 +1859,7 @@ name = "wingui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ldn",
  "tokio",
  "windows",
  "wrest",

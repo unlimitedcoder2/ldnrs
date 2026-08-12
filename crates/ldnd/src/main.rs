@@ -1,4 +1,6 @@
-use ldn::{Lkl, Mode, winusb};
+use std::sync::Arc;
+
+use ldn::{FirmwareProgress, Lkl, Mode, winusb};
 use tokio::{io::AsyncReadExt, net::windows::named_pipe::ServerOptions, signal::ctrl_c};
 
 #[derive(Debug, Default, Clone)]
@@ -74,12 +76,13 @@ async fn main() -> anyhow::Result<()> {
 		.find(|d| d.vid == args.vid && d.pid == args.pid)
 		.ok_or_else(|| anyhow::anyhow!("Selected device not found"))?;
 
+	anyhow::ensure!(device.driver.eq_ignore_ascii_case("winusb"));
+
 	let handle = tokio::runtime::Handle::current();
 	let lkl = Lkl::new(handle);
-	let mut mode = Mode::Lkl(lkl);
+	let mode = Mode::Lkl(lkl);
 
 	let mut logs = mode.logs();
-
 	let _ = tokio::spawn(async move {
 		while let Ok(msg) = logs.recv().await {
 			println!("lkl: {}", msg.trim_end());
@@ -88,10 +91,19 @@ async fn main() -> anyhow::Result<()> {
 
 	let client = wrest::Client::builder().build()?;
 
-	match &mut mode {
+	match &mode {
 		Mode::Lkl(lkl) => {
 			lkl.init().await?;
-			lkl.download_firmware(&device, &client).await?;
+			lkl.download_firmware(
+				&device,
+				&client,
+				Some(Arc::new(|p: FirmwareProgress| {
+					if !p.file.is_empty() {
+						println!("firmware: {}/{} {}", p.done, p.total, p.file);
+					}
+				})),
+			)
+			.await?;
 			lkl.attach(device).await?;
 		}
 	}

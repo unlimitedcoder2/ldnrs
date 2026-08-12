@@ -3,8 +3,12 @@ use std::{
 	ffi::{CStr, CString, c_void},
 	io::ErrorKind,
 	ops::Deref,
+	path::PathBuf,
 	ptr::null_mut,
-	sync::{Arc, OnceLock},
+	sync::{
+		Arc, OnceLock,
+		atomic::{AtomicUsize, Ordering},
+	},
 };
 
 use ::windows::{
@@ -37,6 +41,20 @@ use anyhow::Context;
 
 mod generated;
 pub mod winusb;
+
+#[derive(Debug, Clone)]
+pub struct FirmwareProgress {
+	pub done: usize,
+	pub total: usize,
+	pub file: &'static str,
+}
+
+pub type FirmwareProgressFn = Arc<dyn Fn(FirmwareProgress) + Send + Sync>;
+
+pub fn firmware_dir() -> anyhow::Result<PathBuf> {
+	let home_dir = std::env::home_dir().ok_or_else(|| anyhow::anyhow!("no home dir :("))?;
+	Ok(home_dir.join(".ldnrs").join("firmware"))
+}
 
 pub enum Mode {
 	Lkl(Lkl),
@@ -138,18 +156,37 @@ impl Lkl {
 		Ok(v)
 	}
 
+	pub fn missing_firmware(&self, device: &UsbDevice) -> anyhow::Result<Vec<&'static str>> {
+		let fw_dir = firmware_dir()?;
+
+		Ok(self
+			.get_fw_list(device)?
+			.into_iter()
+			.filter(|fw| !fw_dir.join(fw).is_file())
+			.collect())
+	}
+
 	// TODO: https://git.kernel.org/pub/scm/linux/kernel/git/wens/wireless-regdb.git/ get regulatory.db too
 
 	pub async fn download_firmware(
 		&self,
 		device: &UsbDevice,
 		client: &Client,
+		progress: Option<FirmwareProgressFn>,
 	) -> anyhow::Result<()> {
 		let firmware_files = self.get_fw_list(device)?;
+		let total = firmware_files.len();
+		let done = Arc::new(AtomicUsize::new(0));
 
-		let home_dir = std::env::home_dir().ok_or_else(|| anyhow::anyhow!("no home dir :("))?;
-		let ldnrs_dir = home_dir.join(".ldnrs");
-		let fw_dir = ldnrs_dir.join("firmware");
+		if let Some(progress) = &progress {
+			progress(FirmwareProgress {
+				done: 0,
+				total,
+				file: "",
+			});
+		}
+
+		let fw_dir = firmware_dir()?;
 		tokio::fs::create_dir_all(&fw_dir).await?;
 
 		let mut downloads = JoinSet::new();
@@ -157,9 +194,12 @@ impl Lkl {
 		for fw in firmware_files {
 			let fw_dir = fw_dir.clone();
 			let client = client.clone();
+			let progress = progress.clone();
+			let done = done.clone();
 
 			downloads.spawn(async move {
-				async move {
+				let result = async move {
+					// TODO: Hash or check for updates somehow
 					// TODO: Is this the best place to download from?
 					const LINUX_FW_HOST: &str =
 						"https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/plain";
@@ -199,15 +239,29 @@ impl Lkl {
 					anyhow::Ok(())
 				}
 				.await
-				.with_context(|| fw)
+				.with_context(|| fw);
+
+				if result.is_ok()
+					&& let Some(progress) = &progress
+				{
+					progress(FirmwareProgress {
+						done: done.fetch_add(1, Ordering::Relaxed).saturating_add(1),
+						total,
+						file: fw,
+					});
+				}
+
+				result
 			});
 		}
 
 		let mut errors = Vec::new();
 
 		while let Some(result) = downloads.join_next().await {
-			if let Err(err) = result {
-				errors.push(err);
+			match result {
+				Ok(Ok(())) => {}
+				Ok(Err(err)) => errors.push(err),
+				Err(err) => errors.push(err.into()),
 			}
 		}
 
@@ -381,3 +435,7 @@ unsafe extern "C" fn firmware_vec_string_add(
 		v.push(s);
 	}
 }
+
+// for firmwares that aren't listed in the module MODULE_FIRMWARE macro
+// tokio::task::block_in_place(f)
+// handle.block_on(future)
