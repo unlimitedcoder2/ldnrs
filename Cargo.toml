@@ -5,10 +5,6 @@ members = ["crates/ldn", "crates/ldn-daemon", "crates/wingui", "crates/ldnd"]
 [workspace.dependencies]
 ldn = { path = "./crates/ldn" }
 anyhow = { version = "1.0.104", features = ["backtrace"] }
-compio = { version = "0.19.1", default-features = false, features = ["runtime", "io", "fs", "macros", "signal", "time", "bytes"] }
-futures-channel = "0.3.33"
-futures-util = { version = "0.3.33", default-features = false, features = ["std", "async-await"] }
-wrest = "0.5.7"
 aes = "0.8.4"
 ctr = "0.9.2"
 aes-gcm = "0.10.3"

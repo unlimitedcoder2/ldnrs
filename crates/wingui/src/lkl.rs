@@ -16,13 +16,13 @@ pub fn start(app: &App, hwnd: HWND) {
 	let lkl = app.lkl.clone();
 	let mut logs = lkl.logs();
 
-	app.worker.spawn(move || async move {
+	std::thread::spawn(move || {
 		loop {
 			let line = match logs.try_recv() {
 				Ok(LogEvent::Item(line)) => line,
 				Ok(LogEvent::Dropped(dropped)) => format!("[{dropped} log lines dropped]\r\n"),
 				Err(std::sync::mpsc::TryRecvError::Empty) => {
-					compio::time::sleep(std::time::Duration::from_millis(10)).await;
+					std::thread::sleep(std::time::Duration::from_millis(10));
 					continue;
 				}
 				Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
@@ -35,14 +35,11 @@ pub fn start(app: &App, hwnd: HWND) {
 	});
 
 	let lkl = app.lkl.clone();
-	app.worker.spawn(move || async move {
+	std::thread::spawn(move || {
 		let _ = ui::post_owned(
 			window,
 			WM_LKL_READY,
-			compio::runtime::spawn_blocking(move || lkl.init())
-				.await
-				.map_err(|err| format!("{err}"))
-				.and_then(|result| result.map_err(|err| format!("{err:#}"))),
+			lkl.init().map_err(|err| format!("{err:#}")),
 		);
 	});
 }
@@ -51,7 +48,7 @@ pub fn shutdown(app: &App, hwnd: HWND) {
 	let window = ui::int_from_ptr(hwnd.0);
 	let lkl = app.lkl.clone();
 
-	app.worker.spawn(move || async move {
+	std::thread::spawn(move || {
 		lkl.shutdown();
 		let _ = ui::post_owned(window, WM_LKL_STOPPED, Outcome::Ok(()));
 	});

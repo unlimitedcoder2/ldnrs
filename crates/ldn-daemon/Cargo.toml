@@ -6,10 +6,7 @@ edition = "2024"
 [dependencies]
 ldn = { workspace = true }
 anyhow = { workspace = true }
-compio = { workspace = true }
-futures-channel = { workspace = true }
-futures-util = { workspace = true }
-wrest = { workspace = true }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Networking_WinHttp", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Pipes"] }
 
 [lints]
 workspace = true

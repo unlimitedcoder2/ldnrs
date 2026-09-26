@@ -1,15 +1,15 @@
-use std::cell::Cell;
+use std::collections::VecDeque;
+use std::io::Write;
 use std::rc::Rc;
+use std::sync::mpsc::{Receiver, Sender, channel};
 
-use compio::fs::named_pipe::NamedPipeServer;
-use futures_channel::mpsc::{UnboundedSender, unbounded};
-use futures_util::StreamExt;
-
-use crate::daemon::codec::{Frame, read_frame, write_frame};
+use super::pipe::Pipe;
+use crate::daemon::codec::{Frame, FrameReader};
 use crate::daemon::network::{ChannelState, NetworkState};
 use crate::daemon::{ClientIdent, ControlGuard, Daemon};
 use ldn::broadcast::Event as BroadcastEvent;
 use ldn::crypto::Keys;
+use ldn::logs::LogReceiver;
 use ldn::protocol::messages::{
 	ChannelReply, ConnectRequest, CreateNetworkRequest, HandleRequest, HasProdKeysReply,
 	KickRequest, OpenDatagramReply, OpenDatagramRequest, SetAcceptFilterRequest,
@@ -21,61 +21,139 @@ use ldn::protocol::{
 };
 use ldn::protocol::{WireRead, WirelessProtocol};
 
-pub(super) type Outbound = UnboundedSender<Vec<u8>>;
+pub(super) type Outbound = Sender<Vec<u8>>;
 
-pub(super) async fn run(daemon: Rc<Daemon>, pipe: NamedPipeServer) {
-	let pipe = Rc::new(pipe);
-
-	// The handshake is written directly rather than through the outbound queue: a refused client
-	// must see its reply before the pipe closes, and there is no writer task yet to flush it.
-	let (control, protocol) = match handshake(&daemon, &pipe).await {
-		Ok(Some(accepted)) => accepted,
-		Ok(None) => return,
-		Err(err) => {
-			daemon.log(&format!("connection failed during handshake: {err}"));
-			return;
-		}
-	};
-
-	let (out_tx, mut out_rx) = unbounded::<Vec<u8>>();
-
-	let writer_pipe = Rc::clone(&pipe);
-	let writer = compio::runtime::spawn(async move {
-		while let Some(bytes) = out_rx.next().await {
-			if write_frame(&writer_pipe, bytes).await.is_err() {
-				break;
-			}
-		}
-	});
-
-	let radio = spawn_radio_pump(&daemon, out_tx.clone());
-	let mut logs = None;
-	let mut state = ProtocolState::new(protocol);
-
-	let result = serve_requests(&daemon, &pipe, &out_tx, &mut logs, &mut state).await;
-
-	state.close();
-	if let Err(err) = result {
-		daemon.log(&format!("connection closed: {err}"));
-	}
-
-	drop(radio);
-	drop(state);
-	drop(logs);
-	drop(out_tx);
-	drop(writer);
-	drop(control);
+pub(super) struct Session {
+	daemon: Rc<Daemon>,
+	pipe: Pipe,
+	reader: FrameReader,
+	out: Outbound,
+	incoming: Receiver<Vec<u8>>,
+	pending: VecDeque<Vec<u8>>,
+	written: usize,
+	control: Option<ControlGuard>,
+	state: Option<ProtocolState>,
+	radio: ldn::broadcast::Receiver<super::RadioUpdate>,
+	logs: Option<LogReceiver>,
+	closing: bool,
 }
 
-/// `Ok(None)` means the client was answered and should be disconnected.
-async fn handshake(
-	daemon: &Rc<Daemon>,
-	pipe: &NamedPipeServer,
-) -> std::io::Result<Option<(ControlGuard, WirelessProtocol)>> {
-	let Some(frame) = read_frame(pipe, Vec::new()).await? else {
-		return Ok(None);
-	};
+impl Session {
+	pub(super) fn new(daemon: Rc<Daemon>, pipe: Pipe) -> Self {
+		let (out, incoming) = channel();
+		let radio = daemon.subscribe_radio();
+		Self {
+			daemon,
+			pipe,
+			reader: FrameReader::default(),
+			out,
+			incoming,
+			pending: VecDeque::new(),
+			written: 0,
+			control: None,
+			state: None,
+			radio,
+			logs: None,
+			closing: false,
+		}
+	}
 
+	pub(super) fn poll(&mut self) -> std::io::Result<bool> {
+		// Bound work per turn so a busy client cannot starve cancellation or other clients.
+		for _ in 0..64 {
+			if self.closing {
+				break;
+			}
+			let Some(frame) = self.reader.read(&mut self.pipe)? else {
+				break;
+			};
+			if let Some(state) = &mut self.state {
+				dispatch(&self.daemon, &frame, &self.out, &mut self.logs, state);
+			} else if let Some((control, protocol)) = handshake(&self.daemon, &frame, &self.out) {
+				self.control = Some(control);
+				self.state = Some(ProtocolState::new(protocol));
+			} else {
+				self.closing = true;
+			}
+		}
+		if let Some(state) = &mut self.state {
+			if let ProtocolState::Ldn(ldn) = state {
+				if let Some(scan) = &mut ldn.scan
+					&& scan.poll(&self.daemon, &self.out)
+				{
+					ldn.scan = None;
+				}
+				if let Some(network) = &mut ldn.networks.current {
+					network.poll(&self.out);
+				}
+				for channel in &mut ldn.networks.channels {
+					channel.poll(&self.out);
+				}
+			}
+			for _ in 0..64 {
+				let Ok(event) = self.radio.try_recv() else {
+					break;
+				};
+				if let BroadcastEvent::Item(update) = event {
+					queue_event(
+						&self.out,
+						&Event::Radio {
+							state: update.state.value(),
+							message: update.message,
+						},
+					);
+				}
+			}
+			if let Some(logs) = &mut self.logs {
+				for _ in 0..64 {
+					let Ok(event) = logs.try_recv() else {
+						break;
+					};
+					let event = match event {
+						BroadcastEvent::Item(line) => Event::Log { line },
+						BroadcastEvent::Dropped(lines) => Event::LogDropped {
+							lines: u32::try_from(lines).unwrap_or(u32::MAX),
+						},
+					};
+					queue_event(&self.out, &event);
+				}
+			}
+		}
+		self.pending.extend(self.incoming.try_iter());
+		for _ in 0..64 {
+			let Some(bytes) = self.pending.front() else {
+				break;
+			};
+			let remaining = bytes.get(self.written..).unwrap_or_default();
+			match self.pipe.write(remaining) {
+				Ok(0) => break,
+				Ok(written) => self.written += written,
+				Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+				Err(err) => return Err(err),
+			}
+			if self.written == bytes.len() {
+				self.pending.pop_front();
+				self.written = 0;
+			}
+		}
+		Ok(!self.closing || !self.pending.is_empty())
+	}
+}
+
+impl Drop for Session {
+	fn drop(&mut self) {
+		if let Some(state) = &mut self.state {
+			state.close();
+		}
+	}
+}
+
+/// `None` means the client was answered and should be disconnected.
+fn handshake(
+	daemon: &Rc<Daemon>,
+	frame: &Frame,
+	out: &Outbound,
+) -> Option<(ControlGuard, WirelessProtocol)> {
 	let request_id = frame.header.request_id;
 
 	if frame.header.op() != Some(Op::Hello) {
@@ -83,16 +161,16 @@ async fn handshake(
 			Status::BadRequest,
 			"the first frame on a connection must be Hello",
 		);
-		send_status(pipe, request_id, &reply).await?;
-		return Ok(None);
+		queue_status(out, request_id, &reply);
+		return None;
 	}
 
 	let hello = match Hello::decode(&frame.body) {
 		Ok(hello) => hello,
 		Err(err) => {
 			let reply = StatusReply::error(Status::BadRequest, format!("malformed Hello: {err}"));
-			send_status(pipe, request_id, &reply).await?;
-			return Ok(None);
+			queue_status(out, request_id, &reply);
+			return None;
 		}
 	};
 
@@ -105,8 +183,8 @@ async fn handshake(
 				hello.protocol_version
 			),
 		);
-		send_hello_reply(pipe, request_id, &reply).await?;
-		return Ok(None);
+		queue_hello_reply(out, request_id, &reply);
+		return None;
 	}
 
 	let Some(protocol) = hello.wireless_protocol() else {
@@ -118,13 +196,13 @@ async fn handshake(
 				hello.wireless_protocol
 			),
 		);
-		send_hello_reply(pipe, request_id, &reply).await?;
-		return Ok(None);
+		queue_hello_reply(out, request_id, &reply);
+		return None;
 	};
 
 	let ident = ClientIdent {
-		name: hello.client_name.clone(),
-		version: hello.client_version.clone(),
+		name: hello.client_name,
+		version: hello.client_version,
 		protocol,
 	};
 
@@ -135,9 +213,9 @@ async fn handshake(
 			Status::Busy,
 			format!("another client holds this daemon: {holder}"),
 		);
-		send_hello_reply(pipe, request_id, &reply).await?;
+		queue_hello_reply(out, request_id, &reply);
 
-		return Ok(None);
+		return None;
 	};
 
 	daemon.log(&format!("client connected: {ident}"));
@@ -150,9 +228,9 @@ async fn handshake(
 		radio_ready: daemon.radio_state() == ldn::protocol::RadioState::Ready,
 		error_message: None,
 	};
-	send_hello_reply(pipe, request_id, &reply).await?;
+	queue_hello_reply(out, request_id, &reply);
 
-	Ok(Some((control, protocol)))
+	Some((control, protocol))
 }
 
 fn refusal(daemon: &Rc<Daemon>, status: Status, message: String) -> HelloReply {
@@ -167,14 +245,14 @@ fn refusal(daemon: &Rc<Daemon>, status: Status, message: String) -> HelloReply {
 }
 
 enum ProtocolState {
-	Ldn(LdnState),
+	Ldn(Box<LdnState>),
 	Nwm,
 }
 
 impl ProtocolState {
 	fn new(protocol: WirelessProtocol) -> Self {
 		match protocol {
-			WirelessProtocol::Ldn => Self::Ldn(LdnState::default()),
+			WirelessProtocol::Ldn => Self::Ldn(Box::default()),
 			WirelessProtocol::Nwm => Self::Nwm,
 		}
 	}
@@ -189,7 +267,7 @@ impl ProtocolState {
 
 #[derive(Default)]
 struct LdnState {
-	scan: ScanState,
+	scan: Option<super::scan::Scan>,
 	networks: Networks,
 }
 
@@ -258,40 +336,6 @@ impl Networks {
 	}
 }
 
-#[derive(Default)]
-struct ScanState {
-	task: Option<compio::runtime::JoinHandle<()>>,
-	cancel: Option<Rc<Cell<bool>>>,
-}
-
-impl ScanState {
-	fn is_running(&self) -> bool {
-		self.task.as_ref().is_some_and(|task| !task.is_finished())
-	}
-
-	fn request_cancel(&self) {
-		if let Some(cancel) = &self.cancel {
-			cancel.set(true);
-		}
-	}
-}
-
-async fn serve_requests(
-	daemon: &Rc<Daemon>,
-	pipe: &NamedPipeServer,
-	out: &Outbound,
-	logs: &mut Option<compio::runtime::JoinHandle<()>>,
-	state: &mut ProtocolState,
-) -> std::io::Result<()> {
-	let mut body = Vec::new();
-	while let Some(frame) = read_frame(pipe, body).await? {
-		dispatch(daemon, &frame, out, logs, state);
-		body = frame.body;
-	}
-
-	Ok(())
-}
-
 fn dispatch_channel(daemon: &Rc<Daemon>, frame: &Frame, out: &Outbound, networks: &mut Networks) {
 	let request_id = frame.header.request_id;
 
@@ -337,18 +381,16 @@ fn dispatch_channel(daemon: &Rc<Daemon>, frame: &Frame, out: &Outbound, networks
 			let handle = networks.allocate();
 
 			let opened = if op == LdnOp::OpenDatagram {
-				super::network::open_datagram(ctx, request.port, out, handle).map(
-					|(channel, bound)| {
-						(
-							channel,
-							OpenDatagramReply::ok(handle, bound)
-								.encode()
-								.unwrap_or_default(),
-						)
-					},
-				)
+				super::network::open_datagram(ctx, request.port, handle).map(|(channel, bound)| {
+					(
+						channel,
+						OpenDatagramReply::ok(handle, bound)
+							.encode()
+							.unwrap_or_default(),
+					)
+				})
 			} else {
-				super::network::open_raw(ctx, ifindex, out, handle).map(|channel| {
+				super::network::open_raw(ctx, ifindex, handle).map(|channel| {
 					(
 						channel,
 						ChannelReply::ok(handle).encode().unwrap_or_default(),
@@ -360,7 +402,7 @@ fn dispatch_channel(daemon: &Rc<Daemon>, frame: &Frame, out: &Outbound, networks
 				Ok((channel, body)) => {
 					networks.channels.push(channel);
 
-					let _ = out.unbounded_send(encode_frame(Op::Reply, request_id, &body));
+					let _ = out.send(encode_frame(Op::Reply, request_id, &body));
 					return;
 				}
 				Err(message) => StatusReply::error(Status::Io, message),
@@ -532,7 +574,7 @@ fn dispatch_network(daemon: &Rc<Daemon>, frame: &Frame, out: &Outbound, networks
 
 				(LdnOp::GetNetworkInfo, Ok(network)) => {
 					let body = network.reply().encode().unwrap_or_default();
-					let _ = out.unbounded_send(encode_frame(Op::Reply, request_id, &body));
+					let _ = out.send(encode_frame(Op::Reply, request_id, &body));
 
 					return;
 				}
@@ -559,7 +601,7 @@ fn dispatch(
 	daemon: &Rc<Daemon>,
 	frame: &Frame,
 	out: &Outbound,
-	logs: &mut Option<compio::runtime::JoinHandle<()>>,
+	logs: &mut Option<LogReceiver>,
 	state: &mut ProtocolState,
 ) {
 	let request_id = frame.header.request_id;
@@ -572,7 +614,7 @@ fn dispatch(
 
 		Some(Op::SubscribeLog) => {
 			if logs.is_none() {
-				*logs = Some(spawn_log_pump(daemon, out.clone()));
+				*logs = Some(daemon.logs());
 			}
 			StatusReply::ok()
 		}
@@ -604,9 +646,7 @@ fn dispatch(
 	queue_status(out, request_id, &reply);
 }
 
-/// Returns without queueing anything for operations that answer asynchronously: a scan takes
-/// roughly `channels x dwell` and replies from its own task, so that the read loop stays free to
-/// receive the `ScanCancel` that might stop it.
+/// Scans advance between requests so `ScanCancel` remains responsive during a dwell.
 fn dispatch_ldn(daemon: &Rc<Daemon>, frame: &Frame, out: &Outbound, state: &mut LdnState) {
 	let request_id = frame.header.request_id;
 	let LdnState { scan, networks } = state;
@@ -632,7 +672,7 @@ fn dispatch_ldn(daemon: &Rc<Daemon>, frame: &Frame, out: &Outbound, state: &mut 
 	};
 
 	if op == LdnOp::Scan {
-		if scan.is_running() {
+		if scan.is_some() {
 			queue_status(
 				out,
 				request_id,
@@ -653,22 +693,16 @@ fn dispatch_ldn(daemon: &Rc<Daemon>, frame: &Frame, out: &Outbound, state: &mut 
 			}
 		};
 
-		let cancel = Rc::new(Cell::new(false));
-		scan.cancel = Some(Rc::clone(&cancel));
-		scan.task = Some(compio::runtime::spawn(super::scan::run(
-			Rc::clone(daemon),
-			request,
-			out.clone(),
-			request_id,
-			cancel,
-		)));
+		*scan = super::scan::Scan::start(daemon, &request, out, request_id);
 
 		return;
 	}
 
 	let reply = match op {
 		LdnOp::ScanCancel => {
-			scan.request_cancel();
+			if let Some(scan) = scan.take() {
+				scan.finish(out);
+			}
 			StatusReply::ok()
 		}
 
@@ -709,93 +743,27 @@ fn dispatch_ldn(daemon: &Rc<Daemon>, frame: &Frame, out: &Outbound, state: &mut 
 			let body = HasProdKeysReply::ok(daemon.keys().is_some())
 				.encode()
 				.unwrap_or_default();
-			let _ = out.unbounded_send(encode_frame(Op::Reply, request_id, &body));
+			let _ = out.send(encode_frame(Op::Reply, request_id, &body));
 			return;
 		}
 
 		LdnOp::Scan => StatusReply::error(
 			Status::Internal,
-			"Scan should have been handled by its own task",
+			"Scan should have been handled before dispatch",
 		),
 	};
 
 	queue_status(out, request_id, &reply);
 }
 
-fn spawn_radio_pump(daemon: &Rc<Daemon>, out: Outbound) -> compio::runtime::JoinHandle<()> {
-	let mut updates = daemon.subscribe_radio();
-
-	compio::runtime::spawn(async move {
-		loop {
-			let event = match updates.try_recv() {
-				Ok(event) => event,
-				Err(std::sync::mpsc::TryRecvError::Empty) => {
-					compio::time::sleep(std::time::Duration::from_millis(10)).await;
-					continue;
-				}
-				Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
-			};
-			let BroadcastEvent::Item(update) = event else {
-				continue;
-			};
-
-			queue_event(
-				&out,
-				&Event::Radio {
-					state: update.state.value(),
-					message: update.message,
-				},
-			);
-		}
-	})
-}
-
-fn spawn_log_pump(daemon: &Rc<Daemon>, out: Outbound) -> compio::runtime::JoinHandle<()> {
-	let mut logs = daemon.logs();
-
-	compio::runtime::spawn(async move {
-		loop {
-			let event = match logs.try_recv() {
-				Ok(event) => event,
-				Err(std::sync::mpsc::TryRecvError::Empty) => {
-					compio::time::sleep(std::time::Duration::from_millis(10)).await;
-					continue;
-				}
-				Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
-			};
-			let message = match event {
-				BroadcastEvent::Item(line) => Event::Log { line },
-				BroadcastEvent::Dropped(lines) => Event::LogDropped {
-					lines: u32::try_from(lines).unwrap_or(u32::MAX),
-				},
-			};
-
-			queue_event(&out, &message);
-		}
-	})
-}
-
-async fn send_status(
-	pipe: &NamedPipeServer,
-	request_id: u32,
-	reply: &StatusReply,
-) -> std::io::Result<()> {
+fn queue_hello_reply(out: &Outbound, request_id: u32, reply: &HelloReply) {
 	let body = reply.encode().unwrap_or_default();
-	write_frame(pipe, encode_frame(Op::Reply, request_id, &body)).await
-}
-
-async fn send_hello_reply(
-	pipe: &NamedPipeServer,
-	request_id: u32,
-	reply: &HelloReply,
-) -> std::io::Result<()> {
-	let body = reply.encode().unwrap_or_default();
-	write_frame(pipe, encode_frame(Op::Reply, request_id, &body)).await
+	let _ = out.send(encode_frame(Op::Reply, request_id, &body));
 }
 
 pub(super) fn queue_status(out: &Outbound, request_id: u32, reply: &StatusReply) {
 	let body = reply.encode().unwrap_or_default();
-	let _ = out.unbounded_send(encode_frame(Op::Reply, request_id, &body));
+	let _ = out.send(encode_frame(Op::Reply, request_id, &body));
 }
 
 pub(super) fn queue_event(out: &Outbound, event: &Event) {
@@ -803,5 +771,5 @@ pub(super) fn queue_event(out: &Outbound, event: &Event) {
 		return;
 	};
 
-	let _ = out.unbounded_send(encode_frame(Op::Event, 0, &body));
+	let _ = out.send(encode_frame(Op::Event, 0, &body));
 }

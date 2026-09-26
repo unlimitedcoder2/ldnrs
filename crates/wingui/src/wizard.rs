@@ -718,6 +718,7 @@ impl Wizard {
 			Ok(()) => self.lkl_state.set(LklState::Running),
 			Err(err) => {
 				self.lkl_state.set(LklState::Failed);
+				self.show_log_window();
 				ui::error_box(
 					Some(window),
 					"ldnrs",
@@ -938,8 +939,15 @@ impl Wizard {
 		}
 
 		self.start_adapter();
+		self.show_log_window();
 
 		let _ = unsafe { DestroyWindow(hwnd) };
+	}
+
+	fn show_log_window(&self) {
+		if let Some(window) = self.log_window.get() {
+			let _ = unsafe { ShowWindow(window, SW_SHOW) };
+		}
 	}
 
 	pub fn window_opened(&self) {
@@ -1295,6 +1303,7 @@ impl Wizard {
 			}
 			Err(err) => {
 				ui::set_text(controls.firmware_status, "The firmware was not downloaded.");
+				self.show_log_window();
 				ui::error_box(
 					Some(hwnd),
 					"ldnrs",
@@ -1344,6 +1353,7 @@ impl Wizard {
 			Page::Firmware => {
 				if self.firmware_ready.get() {
 					self.start_adapter();
+					self.show_log_window();
 					let _ = unsafe { DestroyWindow(hwnd) };
 				} else {
 					self.start_download(hwnd);

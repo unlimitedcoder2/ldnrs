@@ -9,11 +9,10 @@ use windows::Win32::System::SystemServices::SS_LEFT;
 use windows::Win32::UI::WindowsAndMessaging::{
 	CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, ES_AUTOVSCROLL,
 	ES_MULTILINE, ES_READONLY, GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, GetWindowRect,
-	IDC_ARROW, LoadCursorW, MoveWindow, RegisterClassW, SW_SHOW, SetWindowLongPtrW, ShowWindow,
-	WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN,
-	WM_CTLCOLORSTATIC, WM_DESTROY, WM_ERASEBKGND, WM_NCCREATE, WM_NCDESTROY, WM_SETTINGCHANGE,
-	WM_SIZE, WNDCLASSW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
-	WS_VSCROLL,
+	IDC_ARROW, LoadCursorW, MoveWindow, RegisterClassW, SetWindowLongPtrW, WINDOW_EX_STYLE,
+	WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLORSTATIC, WM_DESTROY,
+	WM_ERASEBKGND, WM_NCCREATE, WM_NCDESTROY, WM_SETTINGCHANGE, WM_SIZE, WNDCLASSW, WS_BORDER,
+	WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::w;
 
@@ -104,8 +103,6 @@ pub fn open(wizard: &Wizard, owner: HWND) -> anyhow::Result<HWND> {
 			Some(std::ptr::from_ref(wizard).cast()),
 		)
 	}?;
-
-	let _ = unsafe { ShowWindow(hwnd, SW_SHOW) };
 
 	Ok(hwnd)
 }

@@ -1,8 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::time::Duration;
 
-use futures_channel::mpsc::UnboundedSender;
+use super::session::Outbound;
 
 use ldn::channel::{DatagramChannel, RawChannel};
 use ldn::crypto::KeyError;
@@ -18,12 +17,7 @@ use ldn::wlan::MacAddress;
 
 use super::Daemon;
 
-type Outbound = UnboundedSender<Vec<u8>>;
-
-const POLL_MS: u32 = 25;
-const IDLE_MS: u64 = 40;
-const HOST_POLL_MS: u32 = 50;
-const HOST_IDLE_MS: u64 = 5;
+const POLL_MS: u32 = 1;
 const DROP_REPORT_INTERVAL: usize = 1;
 
 enum ChannelKind {
@@ -34,7 +28,8 @@ enum ChannelKind {
 pub(super) struct ChannelState {
 	handle: u32,
 	kind: ChannelKind,
-	pump: Option<compio::runtime::JoinHandle<()>>,
+	reported: usize,
+	active: bool,
 }
 
 impl ChannelState {
@@ -56,8 +51,8 @@ impl ChannelState {
 		}
 	}
 
-	pub(super) fn close(&mut self) {
-		drop(self.pump.take());
+	pub(super) const fn close(&mut self) {
+		self.active = false;
 	}
 }
 
@@ -69,7 +64,7 @@ enum NetworkKind {
 pub(super) struct NetworkState {
 	handle: u32,
 	kind: NetworkKind,
-	pump: Option<compio::runtime::JoinHandle<()>>,
+	active: bool,
 	ifindex: i32,
 }
 
@@ -87,9 +82,7 @@ impl NetworkState {
 	}
 
 	pub(super) fn close(&mut self) {
-		if let Some(pump) = self.pump.take() {
-			drop(pump);
-		}
+		self.active = false;
 
 		match &self.kind {
 			NetworkKind::Station(network) => {
@@ -222,15 +215,13 @@ pub(super) fn connect(
 			let ifindex = network.station().ifindex();
 
 			let network = Rc::new(RefCell::new(network));
-			let pump =
-				compio::runtime::spawn(pump_events(Rc::clone(&network), out.clone(), handle));
 
 			queue_reply(out, request_id, &NetworkReply::joined(handle, info, index));
 
 			Some(NetworkState {
 				handle,
 				kind: NetworkKind::Station(network),
-				pump: Some(pump),
+				active: true,
 				ifindex,
 			})
 		}
@@ -307,15 +298,13 @@ pub(super) fn create(
 			let ifindex = network.access_point().ifindex();
 
 			let network = Rc::new(RefCell::new(network));
-			let pump =
-				compio::runtime::spawn(pump_host_events(Rc::clone(&network), out.clone(), handle));
 
 			queue_reply(out, request_id, &NetworkReply::joined(handle, info, 0));
 
 			Some(NetworkState {
 				handle,
 				kind: NetworkKind::AccessPoint(network),
-				pump: Some(pump),
+				active: true,
 				ifindex,
 			})
 		}
@@ -341,134 +330,115 @@ fn create_status(err: &CreateError) -> (Status, String) {
 	(status, format!("{err}"))
 }
 
-async fn pump_host_events(network: Rc<RefCell<ApNetwork>>, out: Outbound, handle: u32) {
-	loop {
-		let event = {
-			let Ok(mut network) = network.try_borrow_mut() else {
-				compio::time::sleep(Duration::from_millis(HOST_IDLE_MS)).await;
-				continue;
-			};
-
-			if network.is_stopped() {
-				return;
-			}
-
-			let Ok(event) = network.poll(HOST_POLL_MS) else {
-				queue_event(
-					&out,
-					&Event::Disconnect {
-						handle,
-						reason: DISCONNECT_CONNECTION_LOST,
-					},
-				);
-				return;
-			};
-
-			event
-		};
-
-		if let Some(event) = event {
-			let finished = matches!(event, NetworkEvent::Disconnect { .. });
-			queue_event(&out, &wire_event(handle, &event));
-
-			if finished {
-				return;
-			}
+impl NetworkState {
+	pub(super) fn poll(&mut self, out: &Outbound) {
+		if !self.active {
+			return;
 		}
-
-		compio::time::sleep(Duration::from_millis(HOST_IDLE_MS)).await;
+		let event = match &self.kind {
+			NetworkKind::Station(network) => network.borrow_mut().poll(POLL_MS).map_err(|_| ()),
+			NetworkKind::AccessPoint(network) => {
+				let mut network = network.borrow_mut();
+				if network.is_stopped() {
+					self.active = false;
+					return;
+				}
+				network.poll(POLL_MS).map_err(|_| ())
+			}
+		};
+		let event = match event {
+			Ok(Some(event)) => event,
+			Ok(None) => return,
+			Err(()) => NetworkEvent::Disconnect {
+				reason: DISCONNECT_CONNECTION_LOST,
+			},
+		};
+		if matches!(event, NetworkEvent::Disconnect { .. }) {
+			self.active = false;
+		}
+		queue_event(out, &wire_event(self.handle, &event));
 	}
 }
 
 pub(super) fn open_raw(
 	ctx: ldn::sys::KernelContext,
 	ifindex: i32,
-	out: &Outbound,
 	handle: u32,
 ) -> Result<ChannelState, String> {
 	let channel = Rc::new(RawChannel::open(ctx, ifindex).map_err(|err| format!("{err}"))?);
 
-	let pump = compio::runtime::spawn(pump_frames(Rc::clone(&channel), out.clone(), handle));
-
 	Ok(ChannelState {
 		handle,
 		kind: ChannelKind::Raw(channel),
-		pump: Some(pump),
+		reported: 0,
+		active: true,
 	})
 }
 
 pub(super) fn open_datagram(
 	ctx: ldn::sys::KernelContext,
 	port: u16,
-	out: &Outbound,
 	handle: u32,
 ) -> Result<(ChannelState, u16), String> {
 	let channel = Rc::new(DatagramChannel::open(ctx, port).map_err(|err| format!("{err}"))?);
 	let bound = channel.port();
 
-	let pump = compio::runtime::spawn(pump_datagrams(Rc::clone(&channel), out.clone(), handle));
-
 	let state = ChannelState {
 		handle,
 		kind: ChannelKind::Datagram(channel),
-		pump: Some(pump),
+		reported: 0,
+		active: true,
 	};
 
 	Ok((state, bound))
 }
 
-async fn pump_frames(channel: Rc<RawChannel>, out: Outbound, handle: u32) {
-	let mut reported = 0usize;
-
-	loop {
-		let frame = match channel.try_next_frame() {
-			Ok(frame) => frame,
-			Err(std::sync::mpsc::TryRecvError::Empty) => {
-				compio::time::sleep(Duration::from_millis(10)).await;
-				continue;
-			}
-			Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
-		};
-		if out
-			.unbounded_send(encode_frame(Op::Data, 0, &encode_data(handle, &frame)))
-			.is_err()
-		{
+impl ChannelState {
+	pub(super) fn poll(&mut self, out: &Outbound) {
+		if !self.active {
 			return;
 		}
-
-		let dropped = channel.dropped();
-		if dropped > reported && dropped.saturating_sub(reported) >= DROP_REPORT_INTERVAL {
-			reported = dropped;
-
-			queue_event(
-				&out,
-				&Event::ChannelError {
-					handle,
-					status: Status::Io.value(),
-					message: format!("the channel reader has dropped {dropped} frames"),
-				},
-			);
-		}
-	}
-}
-
-async fn pump_datagrams(channel: Rc<DatagramChannel>, out: Outbound, handle: u32) {
-	loop {
-		let datagram = match channel.try_next_datagram() {
-			Ok(datagram) => datagram,
-			Err(std::sync::mpsc::TryRecvError::Empty) => {
-				compio::time::sleep(Duration::from_millis(10)).await;
-				continue;
+		for _ in 0..64 {
+			let payload = match &self.kind {
+				ChannelKind::Raw(channel) => channel.try_next_frame(),
+				ChannelKind::Datagram(channel) => channel.try_next_datagram().map(|datagram| {
+					DatagramData::new(datagram.peer, datagram.port, &datagram.payload).encode()
+				}),
+			};
+			match payload {
+				Ok(payload) => {
+					if out
+						.send(encode_frame(
+							Op::Data,
+							0,
+							&encode_data(self.handle, &payload),
+						))
+						.is_err()
+					{
+						self.active = false;
+						return;
+					}
+				}
+				Err(std::sync::mpsc::TryRecvError::Empty) => break,
+				Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+					self.active = false;
+					break;
+				}
 			}
-			Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
-		};
-		let payload = DatagramData::new(datagram.peer, datagram.port, &datagram.payload).encode();
-
-		if out
-			.unbounded_send(encode_frame(Op::Data, 0, &encode_data(handle, &payload)))
-			.is_err()
-		{
-			return;
+		}
+		if let ChannelKind::Raw(channel) = &self.kind {
+			let dropped = channel.dropped();
+			if dropped.saturating_sub(self.reported) >= DROP_REPORT_INTERVAL {
+				self.reported = dropped;
+				queue_event(
+					out,
+					&Event::ChannelError {
+						handle: self.handle,
+						status: Status::Io.value(),
+						message: format!("the channel reader has dropped {dropped} frames"),
+					},
+				);
+			}
 		}
 	}
 }
@@ -486,43 +456,6 @@ fn connect_error(err: &ConnectError) -> NetworkReply {
 	NetworkReply {
 		auth_status,
 		..NetworkReply::error(status, format!("{err}"))
-	}
-}
-
-async fn pump_events(network: Rc<RefCell<Network>>, out: Outbound, handle: u32) {
-	loop {
-		let event = {
-			// The borrow is held only across one short poll, never across the sleep, so
-			// `GET_NETWORK_INFO` can still read the network between polls.
-			let Ok(mut network) = network.try_borrow_mut() else {
-				compio::time::sleep(Duration::from_millis(IDLE_MS)).await;
-				continue;
-			};
-
-			let Ok(event) = network.poll(POLL_MS) else {
-				queue_event(
-					&out,
-					&Event::Disconnect {
-						handle,
-						reason: DISCONNECT_CONNECTION_LOST,
-					},
-				);
-				return;
-			};
-
-			event
-		};
-
-		if let Some(event) = event {
-			let finished = matches!(event, NetworkEvent::Disconnect { .. });
-			queue_event(&out, &wire_event(handle, &event));
-
-			if finished {
-				return;
-			}
-		}
-
-		compio::time::sleep(Duration::from_millis(IDLE_MS)).await;
 	}
 }
 
@@ -557,7 +490,7 @@ fn wire_event(handle: u32, event: &NetworkEvent) -> Event {
 
 fn queue_reply(out: &Outbound, request_id: u32, reply: &NetworkReply) {
 	let body = reply.encode().unwrap_or_default();
-	let _ = out.unbounded_send(encode_frame(Op::Reply, request_id, &body));
+	let _ = out.send(encode_frame(Op::Reply, request_id, &body));
 }
 
 fn queue_event(out: &Outbound, event: &Event) {
@@ -565,7 +498,7 @@ fn queue_event(out: &Outbound, event: &Event) {
 		return;
 	};
 
-	let _ = out.unbounded_send(encode_frame(Op::Event, 0, &body));
+	let _ = out.send(encode_frame(Op::Event, 0, &body));
 }
 
 fn fresh_random() -> [u8; 16] {

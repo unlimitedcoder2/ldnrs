@@ -1,6 +1,4 @@
-use compio::buf::{BufResult, IntoInner, IoBuf};
-use compio::fs::named_pipe::NamedPipeServer;
-use compio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use std::io::Read;
 
 use ldn::protocol::{FRAME_HEADER_LEN, Header};
 
@@ -10,46 +8,50 @@ pub struct Frame {
 	pub body: Vec<u8>,
 }
 
-pub async fn read_frame(
-	pipe: &NamedPipeServer,
-	mut body: Vec<u8>,
-) -> std::io::Result<Option<Frame>> {
-	let mut reader = pipe;
-
-	let BufResult(result, header_buf) = reader.read([0u8; FRAME_HEADER_LEN]).await;
-	let got = result?;
-
-	if got == 0 {
-		return Ok(None);
-	}
-
-	let header_buf = if got < FRAME_HEADER_LEN {
-		let BufResult(result, rest) = reader.read_exact(header_buf.slice(got..)).await;
-		result?;
-		rest.into_inner()
-	} else {
-		header_buf
-	};
-
-	let header = Header::decode(&header_buf)
-		.map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
-
-	let wanted = usize::try_from(header.body_length).map_err(|_| {
-		std::io::Error::new(std::io::ErrorKind::InvalidData, "body length overflow")
-	})?;
-
-	body.resize(wanted, 0);
-	if wanted != 0 {
-		let BufResult(result, buf) = reader.read_exact(body.slice(..wanted)).await;
-		result?;
-		body = buf.into_inner();
-	}
-
-	Ok(Some(Frame { header, body }))
+/// Retains partial headers and bodies when a nonblocking read would block.
+#[derive(Default)]
+pub(super) struct FrameReader {
+	header: Option<Header>,
+	bytes: Vec<u8>,
 }
 
-pub async fn write_frame(pipe: &NamedPipeServer, bytes: Vec<u8>) -> std::io::Result<()> {
-	let mut writer = pipe;
-	let BufResult(result, _) = writer.write_all(bytes).await;
-	result
+impl FrameReader {
+	pub(super) fn read(&mut self, reader: &mut impl Read) -> std::io::Result<Option<Frame>> {
+		loop {
+			let wanted = self
+				.header
+				.as_ref()
+				.map_or(Ok(FRAME_HEADER_LEN), |header| {
+					usize::try_from(header.body_length).map_err(|_| {
+						std::io::Error::new(std::io::ErrorKind::InvalidData, "body length overflow")
+					})
+				})?;
+			if self.bytes.len() == wanted {
+				if let Some(header) = self.header.take() {
+					return Ok(Some(Frame {
+						header,
+						body: std::mem::take(&mut self.bytes),
+					}));
+				}
+				self.header =
+					Some(Header::decode(&self.bytes).map_err(|err| {
+						std::io::Error::new(std::io::ErrorKind::InvalidData, err)
+					})?);
+				self.bytes.clear();
+				continue;
+			}
+			let mut buffer = [0; 8192];
+			let length = (wanted - self.bytes.len()).min(buffer.len());
+			let target = buffer.get_mut(..length).unwrap_or_default();
+			match reader.read(target) {
+				Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+				Ok(read) => self
+					.bytes
+					.extend_from_slice(target.get(..read).unwrap_or_default()),
+				Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+				Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+				Err(err) => return Err(err),
+			}
+		}
+	}
 }

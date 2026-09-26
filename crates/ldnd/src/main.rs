@@ -1,14 +1,15 @@
 use std::path::PathBuf;
-use std::pin::pin;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use compio::signal::ctrl_c;
-use futures_util::future::{Either, select};
 use ldn::monitor::MonitorSource;
 use ldn::protocol::RadioState;
 use ldn::{FirmwareProgress, KernelOptions, Lkl, logs::LogEvent, winusb};
-use ldn_daemon::daemon::{Daemon, serve};
+use ldn_daemon::daemon::{Daemon, Server};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+use windows::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT, SetConsoleCtrlHandler};
+use windows::core::BOOL;
 
 #[derive(Debug, Default, Clone)]
 struct Args {
@@ -97,8 +98,18 @@ fn parse_args() -> anyhow::Result<Args> {
 	Ok(args)
 }
 
-#[compio::main]
-async fn main() -> anyhow::Result<()> {
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+unsafe extern "system" fn console_handler(event: u32) -> BOOL {
+	if matches!(event, CTRL_C_EVENT | CTRL_BREAK_EVENT) {
+		INTERRUPTED.store(true, Ordering::Release);
+		true.into()
+	} else {
+		false.into()
+	}
+}
+
+fn main() -> anyhow::Result<()> {
 	let mut os_args = std::env::args();
 	_ = os_args.next();
 	for arg in os_args {
@@ -124,9 +135,7 @@ async fn main() -> anyhow::Result<()> {
 
 	let daemon = Daemon::new(Lkl::new(), args.keys.as_deref())?;
 
-	// Its own thread, not a task: a join or a create holds this runtime inside the kernel for
-	// seconds at a time, and a task here would sit on the kernel's log until that returned, which
-	// is exactly when it is wanted, and never if the call hangs.
+	// Kernel calls can take seconds; print their logs from a separate thread.
 	let mut logs = daemon.logs();
 	let _log_pump = std::thread::Builder::new()
 		.name("ldnd-logs".to_owned())
@@ -139,81 +148,81 @@ async fn main() -> anyhow::Result<()> {
 			}
 		})?;
 
-	// The pipe comes up before the adapter does. A client connecting during bring-up gets a
-	// successful Hello with `radio_ready = false` and an EV_RADIO_STATE when that changes, rather
-	// than a bare connection failure it cannot interpret.
-	println!("ldnd: socket {:?}", args.socket);
-	let listener = compio::runtime::spawn({
-		let daemon = Rc::clone(&daemon);
-		let socket = args.socket.clone();
+	// Bind before starting slow adapter work so clients can observe its radio state.
+	let mut server = Server::new(
+		Rc::clone(&daemon),
+		args.socket.unwrap_or_else(|| r"\\.\pipe\ldnd".to_owned()),
+	)?;
+	unsafe { SetConsoleCtrlHandler(Some(console_handler), true) }?;
 
-		async move {
-			if let Err(err) = serve(
-				Rc::clone(&daemon),
-				socket.unwrap_or_else(|| r"\\.\pipe\ldnd".to_string()),
-			)
-			.await
+	let bringup = if args.vid == 0 && args.pid == 0 {
+		daemon.set_radio_state(
+			RadioState::Idle,
+			Some("no adapter selected; pass --usb vid:pid".to_owned()),
+		);
+		None
+	} else {
+		daemon.set_radio_state(RadioState::Attaching, None);
+		let lkl = daemon.lkl().clone();
+		Some(
+			std::thread::Builder::new()
+				.name("ldnd-bringup".to_owned())
+				.spawn(move || {
+					bring_up(
+						&lkl,
+						args.vid,
+						args.pid,
+						&KernelOptions { extra: args.kargs },
+					)
+				})?,
+		)
+	};
+	let mut bringup = bringup;
+	let result = (|| -> anyhow::Result<()> {
+		while !INTERRUPTED.load(Ordering::Acquire) && !daemon.shutdown_requested() {
+			if bringup
+				.as_ref()
+				.is_some_and(std::thread::JoinHandle::is_finished)
+				&& let Some(task) = bringup.take()
 			{
-				println!("ldnd: {err:#}");
-				daemon.request_shutdown();
-			}
-		}
-	});
-
-	let bringup = compio::runtime::spawn({
-		let daemon = Rc::clone(&daemon);
-
-		async move {
-			if args.vid == 0 && args.pid == 0 {
-				daemon.set_radio_state(
-					RadioState::Idle,
-					Some("no adapter selected; pass --usb vid:pid".to_owned()),
-				);
-				return;
-			}
-
-			daemon.set_radio_state(RadioState::Attaching, None);
-
-			match bring_up(
-				&daemon,
-				args.vid,
-				args.pid,
-				KernelOptions { extra: args.kargs },
-			)
-			.await
-			{
-				Ok(()) => daemon.set_radio_state(RadioState::Ready, None),
-				Err(err) => {
-					println!("ldnd: adapter bring-up failed: {err:#}");
-					daemon.set_radio_state(RadioState::Failed, Some(format!("{err:#}")));
+				match task
+					.join()
+					.map_err(|_| anyhow::anyhow!("adapter bring-up thread panicked"))?
+				{
+					Ok(monitor) => {
+						daemon.set_phyname("phy0");
+						daemon.set_frame_source(monitor.into_source());
+						daemon.set_radio_state(RadioState::Ready, None);
+					}
+					Err(err) => {
+						println!("ldnd: adapter bring-up failed: {err:#}");
+						daemon.set_radio_state(RadioState::Failed, Some(format!("{err:#}")));
+					}
 				}
 			}
+			server.poll()?;
+			std::thread::sleep(Duration::from_millis(10));
 		}
-	});
-
-	let reason = match select(pin!(ctrl_c()), pin!(daemon.wait_for_shutdown())).await {
-		Either::Left((result, _)) => {
-			result?;
-			"ctrl-c"
-		}
-		Either::Right(((), _)) => "a client's Shutdown request",
-	};
-
-	println!("ldnd: stopping ({reason})");
-
-	drop(bringup);
-	drop(listener);
+		Ok(())
+	})();
+	println!("ldnd: stopping");
+	INTERRUPTED.store(true, Ordering::Release);
+	// Bring-up owns kernel resources too; finish it before shutting the kernel down.
+	if let Some(task) = bringup {
+		let _ = task.join();
+	}
+	drop(server);
 	daemon.lkl().shutdown();
-
-	Ok(())
+	unsafe { SetConsoleCtrlHandler(Some(console_handler), false) }?;
+	result
 }
 
-async fn bring_up(
-	daemon: &Rc<Daemon>,
+fn bring_up(
+	lkl: &Lkl,
 	vid: u16,
 	pid: u16,
-	kernel: KernelOptions,
-) -> anyhow::Result<()> {
+	kernel: &KernelOptions,
+) -> anyhow::Result<MonitorSource> {
 	let device = winusb::get_devices()?
 		.into_iter()
 		.find(|d| d.vid == vid && d.pid == pid)
@@ -226,36 +235,21 @@ async fn bring_up(
 		device.driver
 	);
 
-	let lkl = daemon.lkl();
+	ensure_running()?;
+	lkl.init_with(kernel)?;
+	ensure_running()?;
+	let progress: ldn::FirmwareProgressFn = Arc::new(|progress: FirmwareProgress| {
+		if !progress.file.is_empty() {
+			println!(
+				"firmware: {}/{} {}",
+				progress.done, progress.total, progress.file
+			);
+		}
+	});
+	ldn_daemon::firmware::download_firmware(lkl, &device, Some(&progress), None)?;
 
-	let client = wrest::Client::builder().build()?;
-
-	compio::runtime::spawn_blocking({
-		let lkl = lkl.clone();
-		move || lkl.init_with(&kernel)
-	})
-	.await
-	.map_err(|err| anyhow::anyhow!("blocking task failed: {err}"))??;
-	ldn_daemon::firmware::download_firmware(
-		lkl,
-		&device,
-		&client,
-		Some(Arc::new(|progress: FirmwareProgress| {
-			if !progress.file.is_empty() {
-				println!(
-					"firmware: {}/{} {}",
-					progress.done, progress.total, progress.file
-				);
-			}
-		})),
-	)
-	.await?;
-	compio::runtime::spawn_blocking({
-		let lkl = lkl.clone();
-		move || lkl.attach(device)
-	})
-	.await
-	.map_err(|err| anyhow::anyhow!("blocking task failed: {err}"))??;
+	ensure_running()?;
+	lkl.attach(device)?;
 
 	let ctx = lkl
 		.context()
@@ -263,6 +257,7 @@ async fn bring_up(
 
 	let mut last = None;
 	for _ in 0..30 {
+		ensure_running()?;
 		match MonitorSource::create(ctx, "phy0", "ldn-mon") {
 			Ok(monitor) => {
 				println!(
@@ -270,18 +265,24 @@ async fn bring_up(
 					monitor.name(),
 					monitor.ifindex()
 				);
-				daemon.set_phyname("phy0");
-				daemon.set_frame_source(monitor.into_source());
-				return Ok(());
+				return Ok(monitor);
 			}
 			Err(err) => last = Some(err),
 		}
 
-		compio::time::sleep(std::time::Duration::from_secs(1)).await;
+		std::thread::sleep(Duration::from_secs(1));
 	}
 
 	anyhow::bail!(
 		"the adapter attached but no monitor interface could be created: {}",
 		last.map_or_else(|| "no wiphy appeared".to_owned(), |err| format!("{err}"))
 	)
+}
+
+fn ensure_running() -> anyhow::Result<()> {
+	anyhow::ensure!(
+		!INTERRUPTED.load(Ordering::Acquire),
+		"adapter bring-up cancelled"
+	);
+	Ok(())
 }

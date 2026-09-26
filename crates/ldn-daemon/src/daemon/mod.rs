@@ -1,15 +1,14 @@
 mod codec;
 mod network;
 mod nwm;
+mod pipe;
 mod scan;
 mod session;
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use compio::fs::named_pipe::ServerOptions;
-use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
-use futures_util::StreamExt;
+use std::time::Duration;
 
 use ldn::Lkl;
 use ldn::broadcast::{Broadcast, Receiver};
@@ -67,8 +66,7 @@ pub struct Daemon {
 	radio_events: Broadcast<RadioUpdate>,
 	control: RefCell<Option<ClientIdent>>,
 	phyname: RefCell<String>,
-	shutdown_tx: UnboundedSender<()>,
-	shutdown_rx: RefCell<Option<UnboundedReceiver<()>>>,
+	shutdown: Cell<bool>,
 }
 
 impl Daemon {
@@ -77,8 +75,6 @@ impl Daemon {
 	/// without `prod.keys`; operations that need them fail with [`Status::NoKeys`](ldn::protocol::Status)
 	/// until a [`SetProdKeys`](ldn::protocol::LdnOp::SetProdKeys) arrives.
 	pub fn new(lkl: Lkl, keys_path: Option<&Path>) -> anyhow::Result<Rc<Self>> {
-		let (shutdown_tx, shutdown_rx) = unbounded();
-
 		let keys = keys_path
 			.map(|path| {
 				Keys::load(path)
@@ -97,8 +93,7 @@ impl Daemon {
 			radio_events: Broadcast::new(),
 			control: RefCell::new(None),
 			phyname: RefCell::new("phy0".to_owned()),
-			shutdown_tx,
-			shutdown_rx: RefCell::new(Some(shutdown_rx)),
+			shutdown: Cell::new(false),
 		}))
 	}
 
@@ -197,44 +192,75 @@ impl Daemon {
 	}
 
 	pub fn request_shutdown(&self) {
-		let _ = self.shutdown_tx.unbounded_send(());
+		self.shutdown.set(true);
 	}
 
-	pub async fn wait_for_shutdown(&self) {
-		let receiver = self.shutdown_rx.borrow_mut().take();
+	#[must_use]
+	pub const fn shutdown_requested(&self) -> bool {
+		self.shutdown.get()
+	}
+}
 
-		match receiver {
-			Some(mut rx) => {
-				let _ = rx.next().await;
+pub struct Server {
+	daemon: Rc<Daemon>,
+	socket: String,
+	next: pipe::Pipe,
+	sessions: Vec<session::Session>,
+}
+
+impl Server {
+	/// # Errors
+	/// If the named pipe cannot be created, including when another server owns its name.
+	pub fn new(daemon: Rc<Daemon>, socket: String) -> anyhow::Result<Self> {
+		let next = pipe::Pipe::create(&socket, true)
+			.map_err(|err| anyhow::anyhow!("failed to create the pipe {socket}: {err}"))?;
+		daemon.log(&format!("listening on {socket}"));
+		Ok(Self {
+			daemon,
+			socket,
+			next,
+			sessions: Vec::new(),
+		})
+	}
+
+	/// # Errors
+	/// If a listening pipe cannot be created or accepted.
+	pub fn poll(&mut self) -> anyhow::Result<()> {
+		match self.next.accept() {
+			Ok(true) => {
+				let next = pipe::Pipe::create(&self.socket, false)?;
+				let pipe = std::mem::replace(&mut self.next, next);
+				self.sessions
+					.push(session::Session::new(Rc::clone(&self.daemon), pipe));
 			}
-			None => core::future::pending::<()>().await,
+			Ok(false) => {}
+			Err(err)
+				if err.raw_os_error()
+					== Some(windows::Win32::Foundation::ERROR_NO_DATA.0.cast_signed()) =>
+			{
+				// A client connected and closed before we could accept it.
+				self.next = pipe::Pipe::create(&self.socket, false)?;
+			}
+			Err(err) => return Err(err.into()),
 		}
+		self.sessions.retain_mut(|session| match session.poll() {
+			Ok(open) => open,
+			Err(err) => {
+				self.daemon.log(&format!("connection closed: {err}"));
+				false
+			}
+		});
+		Ok(())
 	}
 }
 
 /// # Errors
-/// If the named pipe cannot be created.
-pub async fn serve(daemon: Rc<Daemon>, socket: String) -> anyhow::Result<()> {
-	let mut next = ServerOptions::new()
-		.first_pipe_instance(true)
-		.create(&socket)
-		.map_err(|err| anyhow::anyhow!("failed to create the pipe {socket}: {err}"))?;
-
-	daemon.log(&format!("listening on {socket}"));
-
-	loop {
-		let pipe = next;
-
-		next = ServerOptions::new()
-			.create(&socket)
-			.map_err(|err| anyhow::anyhow!("failed to create a pipe instance: {err}"))?;
-
-		if let Err(err) = pipe.connect().await {
-			daemon.log(&format!("failed to accept a connection: {err}"));
-			continue;
-		}
-
-		let daemon = Rc::clone(&daemon);
-		compio::runtime::spawn(session::run(daemon, pipe)).detach();
+/// If the named pipe cannot be created or accepted.
+pub fn serve(daemon: Rc<Daemon>, socket: String) -> anyhow::Result<()> {
+	let mut server = Server::new(daemon, socket)?;
+	while !server.daemon.shutdown_requested() {
+		server.poll()?;
+		std::thread::sleep(Duration::from_millis(10));
 	}
+	Ok(())
 }

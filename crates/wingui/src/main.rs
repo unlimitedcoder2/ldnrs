@@ -9,10 +9,10 @@ mod install;
 mod keys;
 mod lkl;
 mod logwindow;
+mod manual_firmware;
 mod theme;
 mod ui;
 mod wizard;
-mod worker;
 
 use windows::Win32::UI::Controls::{
 	ICC_LISTVIEW_CLASSES, ICC_PROGRESS_CLASS, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX,
@@ -40,7 +40,7 @@ fn run() -> anyhow::Result<()> {
 
 	theme::init_process();
 
-	let app = App::new()?;
+	let app = App::new();
 	let wizard = Box::new(Wizard::new(app));
 
 	wizard::open(&wizard)?;
