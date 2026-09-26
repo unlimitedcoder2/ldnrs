@@ -12,21 +12,31 @@ windows = { version = "0.62.2", features = [
 	"Win32_System_Console",
 	"Win32_Storage_FileSystem",
 	"Win32_Security",
+	"Win32_Security_Cryptography",
+	"Win32_Security_Cryptography_Catalog",
+	"Win32_Security_Cryptography_Sip",
+	"Win32_Security_WinTrust",
 	"Win32_System_IO",
 	"Win32_System_WindowsProgramming",
 	"Win32_System_LibraryLoader",
 	"Win32_System_SystemServices",
+	"Win32_Graphics_Dwm",
 	"Win32_Graphics_Gdi",
 	"Win32_UI_WindowsAndMessaging",
 	"Win32_UI_Controls",
+	"Win32_UI_Controls_Dialogs",
+	"Win32_UI_Shell",
 	"Win32_UI_Input_KeyboardAndMouse",
 ] }
 
 [dependencies]
 anyhow = { workspace = true }
-tokio = { workspace = true }
+compio = { workspace = true }
+futures-channel = { workspace = true }
+futures-util = { workspace = true }
 wrest = { workspace = true }
 ldn = { workspace = true }
+ldn-daemon = { path = "../ldn-daemon" }
 
 [lints]
 workspace = true

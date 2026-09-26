@@ -20,14 +20,18 @@ windows = { version = "0.62.2", features = [
 
 [dependencies]
 anyhow = { workspace = true }
-tokio = { workspace = true }
-wrest = { workspace = true }
+aes = { workspace = true }
+ctr = { workspace = true }
+aes-gcm = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+getrandom = { workspace = true }
+bitflags = "2.13.2"
 
 [build-dependencies]
 bindgen = { version = "0.72.1" }
 
 [target.'cfg(windows)'.build-dependencies]
-# windows sucks https://learn.microsoft.com/en-gb/windows/win32/fileio/naming-a-file?redirectedfrom=MSDN
 dunce = { version = "1.0.5" }
 
 [lints]

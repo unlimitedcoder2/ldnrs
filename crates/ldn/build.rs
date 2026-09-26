@@ -1,59 +1,46 @@
-// #![allow(rust_2018_idioms)]
-#![allow(
-	non_snake_case,
-	non_camel_case_types,
-	dead_code,
-	unused_variables,
-	unused_braces,
-	clippy::all,
-	clippy::unwrap_used,
-	clippy::unnecessary_debug_formatting
-)]
 use std::{error::Error, path::Path};
-
-#[allow(unused)]
-macro_rules! p {
-	($($tokens: tt)*) => {
-		println!("cargo::warning={}", format!($($tokens)*))
-	}
-}
 
 type AnyResult<T> = Result<T, Box<dyn Error>>;
 
-fn main() {
-	let dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-	let dir = Path::new(&dir);
-	let src = dir.join("src");
+fn main() -> AnyResult<()> {
+	let dir = std::env::var("CARGO_MANIFEST_DIR")?;
+	inner(Path::new(&dir))?;
 
-	let generated_path = src.join("generated.rs");
-
-	// let _ = std::fs::remove_file(&generated_path);
-
-	if let Err(err) = inner(dir) {
-		let err = format!("{}", err);
-		let mut contents = format!("compile_error!({err:?});\n\n");
-		for line in err.lines() {
-			contents.push_str("// ");
-			contents.push_str(line);
-			contents.push_str("\n");
-		}
-		std::fs::write(&generated_path, contents.as_bytes()).unwrap();
+	if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+		println!("cargo:rustc-link-lib=legacy_stdio_definitions");
 	}
+
+	println!("cargo:rustc-link-lib=advapi32");
+	Ok(())
+}
+
+#[cfg(windows)]
+fn canonicalize(path: &Path) -> std::io::Result<std::path::PathBuf> {
+	dunce::canonicalize(path)
+}
+
+#[cfg(not(windows))]
+fn canonicalize(path: &Path) -> std::io::Result<std::path::PathBuf> {
+	std::fs::canonicalize(path)
 }
 
 fn get_path_string(path: &Path) -> AnyResult<String> {
-	let s = dunce::canonicalize(path)?
+	let s = canonicalize(path)?
 		.into_os_string()
 		.into_string()
-		.map_err(|_| format!("Failed to create path for {:?}", path))?;
+		.map_err(|_| format!("Failed to create path for {}", path.display()))?;
 
 	Ok(s)
 }
 
 fn link_ldn_lkl(ldn_lkl_dir: &Path) -> AnyResult<()> {
-	const ARCHIVE: &str = "ldn-lkl.a";
+	let archive_name = if std::env::var("PROFILE").as_deref() == Ok("release") {
+		"ldn-lkl.a"
+	} else {
+		"ldn-lkl-debug.a"
+	};
 
-	let archive = ldn_lkl_dir.join(ARCHIVE);
+	let archive = ldn_lkl_dir.join(archive_name);
 	if !archive.is_file() {
 		return Err(format!(
 			"{} not found. Build it first: `cd ldnlkl && make LKL_DIR=<linux tree> -B`",
@@ -67,7 +54,7 @@ fn link_ldn_lkl(ldn_lkl_dir: &Path) -> AnyResult<()> {
 		"cargo:rustc-link-search=native={}",
 		get_path_string(ldn_lkl_dir)?
 	);
-	println!("cargo:rustc-link-lib=static:+verbatim={ARCHIVE}");
+	println!("cargo:rustc-link-lib=static:+verbatim={archive_name}");
 
 	for lib in ["ws2_32", "winmm"] {
 		println!("cargo:rustc-link-lib={lib}");
@@ -88,17 +75,18 @@ fn inner(dir: &Path) -> AnyResult<()> {
 	let path = ldn_lkl_include_dir.join("lib.h");
 	let path = get_path_string(&path)?;
 
+	println!("cargo:rerun-if-changed={path}");
+
 	let ldn_lkl_include_dir = get_path_string(&ldn_lkl_include_dir)?;
 	let ldn_lkl_vendor_dir = get_path_string(&ldn_lkl_vendor_dir)?;
 
 	let bindings = builder()
-		.raw_line("#![allow(non_snake_case, non_camel_case_types, dead_code, unused_variables, unused_braces, clippy::all)]\n\n")
 		.header(&path)
 		.clang_arg(format!("-I{}", ldn_lkl_include_dir))
 		.clang_arg(format!("-I{}", ldn_lkl_vendor_dir))
 		.generate()?;
 
-	let gen_file = dir.join("src").join("generated.rs");
+	let gen_file = Path::new(&std::env::var("OUT_DIR")?).join("generated.rs");
 	bindings.write_to_file(gen_file)?;
 
 	Ok(())

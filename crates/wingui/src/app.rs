@@ -1,28 +1,24 @@
-use std::sync::Arc;
-
 use ldn::Lkl;
-use tokio::runtime::Runtime;
 use wrest::Client;
 
+use crate::worker::Worker;
+
 pub struct App {
-	pub runtime: Runtime,
-	pub lkl: Arc<Lkl>,
+	pub worker: Worker,
+	pub lkl: Lkl,
 	pub client: Client,
 }
 
 impl App {
 	pub fn new() -> anyhow::Result<Self> {
-		let runtime = tokio::runtime::Builder::new_multi_thread()
-			.enable_all()
-			.build()?;
+		let worker = Worker::new()?;
 
-		let lkl = Arc::new(Lkl::new(runtime.handle().clone()));
-		runtime.block_on(lkl.init())?;
+		let lkl = Lkl::new();
 
 		let client = Client::builder().build()?;
 
 		Ok(Self {
-			runtime,
+			worker,
 			lkl,
 			client,
 		})

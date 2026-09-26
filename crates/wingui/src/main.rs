@@ -1,27 +1,29 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod codesign;
+mod config;
+mod daemon;
 mod firmware;
 mod install;
+mod keys;
+mod lkl;
+mod logwindow;
+mod theme;
 mod ui;
 mod wizard;
+mod worker;
 
-use windows::Win32::Foundation::{HINSTANCE, RECT};
-use windows::Win32::Graphics::Gdi::{COLOR_WINDOW, GetSysColorBrush, UpdateWindow};
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{
-	ICC_LISTVIEW_CLASSES, ICC_PROGRESS_CLASS, INITCOMMONCONTROLSEX, InitCommonControlsEx,
+	ICC_LISTVIEW_CLASSES, ICC_PROGRESS_CLASS, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX,
+	InitCommonControlsEx,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-	AdjustWindowRectEx, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DispatchMessageW, GetMessageW,
-	GetSystemMetrics, IDC_ARROW, IsDialogMessageW, LoadCursorW, MSG, RegisterClassW, SM_CXSCREEN,
-	SM_CYSCREEN, SW_SHOW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WNDCLASSW, WS_CAPTION,
-	WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
+	DispatchMessageW, GetMessageW, IsDialogMessageW, MSG, TranslateMessage,
 };
-use windows::core::w;
 
 use crate::app::App;
-use crate::wizard::{CLIENT_HEIGHT, CLIENT_WIDTH, Wizard, wndproc};
+use crate::wizard::Wizard;
 
 fn main() {
 	if let Err(err) = run() {
@@ -30,74 +32,18 @@ fn main() {
 }
 
 fn run() -> anyhow::Result<()> {
-	let instance = HINSTANCE(unsafe { GetModuleHandleW(None) }?.0);
-
 	let controls = INITCOMMONCONTROLSEX {
-		dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
-		dwICC: ICC_LISTVIEW_CLASSES | ICC_PROGRESS_CLASS,
+		dwSize: ui::size_u32::<INITCOMMONCONTROLSEX>(),
+		dwICC: ICC_LISTVIEW_CLASSES | ICC_PROGRESS_CLASS | ICC_STANDARD_CLASSES,
 	};
 	let _ = unsafe { InitCommonControlsEx(&raw const controls) };
 
-	let class_name = w!("LdnrsWizard");
-
-	let class = WNDCLASSW {
-		style: CS_HREDRAW | CS_VREDRAW,
-		lpfnWndProc: Some(wndproc),
-		hInstance: instance,
-		hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }?,
-		hbrBackground: unsafe { GetSysColorBrush(COLOR_WINDOW) },
-		lpszClassName: class_name,
-		..Default::default()
-	};
-
-	if unsafe { RegisterClassW(&raw const class) } == 0 {
-		return Err(windows::core::Error::from_thread().into());
-	}
-
-	let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-
-	let mut rect = RECT {
-		left: 0,
-		top: 0,
-		right: CLIENT_WIDTH,
-		bottom: CLIENT_HEIGHT,
-	};
-	unsafe { AdjustWindowRectEx(&raw mut rect, style, false, WINDOW_EX_STYLE::default()) }?;
-
-	let width = rect.right.saturating_sub(rect.left);
-	let height = rect.bottom.saturating_sub(rect.top);
-	let x = unsafe { GetSystemMetrics(SM_CXSCREEN) }
-		.saturating_sub(width)
-		.saturating_div(2);
-	let y = unsafe { GetSystemMetrics(SM_CYSCREEN) }
-		.saturating_sub(height)
-		.saturating_div(2);
+	theme::init_process();
 
 	let app = App::new()?;
+	let wizard = Box::new(Wizard::new(app));
 
-	let mut wizard = Box::new(Wizard::new(app));
-
-	let hwnd = unsafe {
-		CreateWindowExW(
-			WINDOW_EX_STYLE::default(),
-			class_name,
-			w!("ldnrs device wizard"),
-			style,
-			x,
-			y,
-			width,
-			height,
-			None,
-			None,
-			Some(instance),
-			Some(std::ptr::from_mut(wizard.as_mut()).cast()),
-		)
-	}?;
-
-	unsafe {
-		let _ = ShowWindow(hwnd, SW_SHOW);
-		let _ = UpdateWindow(hwnd);
-	}
+	wizard::open(&wizard)?;
 
 	let mut msg = MSG::default();
 	loop {
@@ -111,7 +57,9 @@ fn run() -> anyhow::Result<()> {
 			return Err(windows::core::Error::from_thread().into());
 		}
 
-		if unsafe { IsDialogMessageW(hwnd, &raw const msg) }.as_bool() {
+		if let Some(dialog) = wizard.dialog()
+			&& unsafe { IsDialogMessageW(dialog, &raw const msg) }.as_bool()
+		{
 			continue;
 		}
 

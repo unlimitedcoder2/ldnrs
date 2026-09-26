@@ -5,8 +5,10 @@ edition = "2024"
 
 [dependencies]
 ldn = { workspace = true }
+ldn-daemon = { path = "../ldn-daemon" }
 anyhow = { workspace = true }
-tokio = { workspace = true }
+compio = { workspace = true }
+futures-util = { workspace = true }
 wrest = { workspace = true }
 
 [lints]

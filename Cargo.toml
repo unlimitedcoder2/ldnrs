@@ -1,32 +1,35 @@
 [workspace]
 resolver = "3"
-members = ["crates/ldn", "crates/wingui", "crates/ldnd"]
+members = ["crates/ldn", "crates/ldn-daemon", "crates/wingui", "crates/ldnd"]
 
 [workspace.dependencies]
 ldn = { path = "./crates/ldn" }
 anyhow = { version = "1.0.104", features = ["backtrace"] }
-tokio = { version = "1.53.1", features = ["macros", "fs", "signal", "io-util", "rt-multi-thread", "sync", "net"] }
+compio = { version = "0.19.1", default-features = false, features = ["runtime", "io", "fs", "macros", "signal", "time", "bytes"] }
+futures-channel = "0.3.33"
+futures-util = { version = "0.3.33", default-features = false, features = ["std", "async-await"] }
 wrest = "0.5.7"
+aes = "0.8.4"
+ctr = "0.9.2"
+aes-gcm = "0.10.3"
+sha2 = "0.10.9"
+hmac = "0.12.1"
+getrandom = "0.4.3"
 
 [profile.release]
 lto = true
-#opt-level = 2
+opt-level = 2
 codegen-units = 1
-debug = true
-strip = true
 
-# https://www.namtao.com/rust/
 [workspace.lints.clippy]
 manual_range_contains = "allow"
-# UM, ACTUALLY
 pedantic = { level = "deny", priority = -1 }
-# DEVELOPING LINTS
 nursery = { level = "deny", priority = -1 }
-# DENY PANICS
+future_not_send = "allow"
 unwrap_used = "deny"
 expect_used = "deny"
 indexing_slicing = "deny"
-arithmetic_side_effects = "deny"
+arithmetic_side_effects = "allow"
 unreachable = "deny"
 unimplemented = "deny"
 unchecked_time_subtraction = "deny"

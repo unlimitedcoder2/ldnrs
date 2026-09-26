@@ -1,2 +1,4 @@
 /target
 lkl
+__pycache__/
+*.py[cod]
