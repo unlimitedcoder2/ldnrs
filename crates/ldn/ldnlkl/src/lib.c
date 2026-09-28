@@ -56,7 +56,7 @@ static void *ldn_timer_alloc(void (*fn)(void)) {
 	return t;
 }
 
-static int ldn_timer_set_oneshot(void *timer, unsigned long ns) {
+static int ldn_timer_set_oneshot(void *timer, lkl_ulong_t ns) {
 	LdnTimer *t = timer;
 
 	LONGLONG due = -(LONGLONG) (((ULONGLONG) ns + 99) / 100);
