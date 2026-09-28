@@ -20,6 +20,12 @@ struct Subscriber<T> {
 	dropped: Arc<AtomicUsize>,
 }
 
+impl<T> Subscriber<T> {
+	fn is_live(&self) -> bool {
+		Arc::strong_count(&self.dropped) > 1
+	}
+}
+
 pub struct Broadcast<T> {
 	subscribers: Mutex<Vec<Subscriber<T>>>,
 }
@@ -42,7 +48,9 @@ impl<T: Clone> Broadcast<T> {
 		let (tx, rx) = sync_channel(CAPACITY);
 		let dropped = Arc::new(AtomicUsize::new(0));
 
-		self.lock().push(Subscriber {
+		let mut subscribers = self.lock();
+		subscribers.retain(Subscriber::is_live);
+		subscribers.push(Subscriber {
 			tx,
 			dropped: Arc::clone(&dropped),
 		});

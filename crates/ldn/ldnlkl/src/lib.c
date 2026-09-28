@@ -14,11 +14,74 @@
 
 #include <stdlib.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#include <mmsystem.h>
+#endif
+
 typedef struct {
 	LdnLklUsbOps             usb_ops;
 	struct lkl_usb_host_ops  lkl_usb_ops;
 	bool                     usb_attached;
 } LklCtx;
+
+#ifdef _WIN32
+typedef struct {
+	PTP_TIMER timer;
+	void    (*fn)(void);
+} LdnTimer;
+
+static VOID CALLBACK ldn_timer_fire(PTP_CALLBACK_INSTANCE instance, PVOID context, PTP_TIMER timer) {
+	UNUSED(instance);
+	UNUSED(timer);
+
+	((LdnTimer *) context)->fn();
+}
+
+static void *ldn_timer_alloc(void (*fn)(void)) {
+	timeBeginPeriod(1);
+
+	LdnTimer *t = malloc(sizeof(*t));
+	if (!t) {
+		return NULL;
+	}
+
+	t->fn = fn;
+	t->timer = CreateThreadpoolTimer(ldn_timer_fire, t, NULL);
+	if (!t->timer) {
+		free(t);
+		return NULL;
+	}
+
+	return t;
+}
+
+static int ldn_timer_set_oneshot(void *timer, unsigned long ns) {
+	LdnTimer *t = timer;
+
+	LONGLONG due = -(LONGLONG) (((ULONGLONG) ns + 99) / 100);
+	if (due == 0) {
+		due = -1;
+	}
+
+	FILETIME ft = {
+		.dwLowDateTime = (DWORD) ((ULONGLONG) due & 0xFFFFFFFF),
+		.dwHighDateTime = (DWORD) ((ULONGLONG) due >> 32),
+	};
+
+	SetThreadpoolTimer(t->timer, &ft, 0, 0);
+	return 0;
+}
+
+static void ldn_timer_free(void *timer) {
+	LdnTimer *t = timer;
+
+	SetThreadpoolTimer(t->timer, NULL, 0, 0);
+	WaitForThreadpoolTimerCallbacks(t->timer, TRUE);
+	CloseThreadpoolTimer(t->timer);
+	free(t);
+}
+#endif
 
 void ldn_lkl_print_impl(const char *s, i32 len, void *userdata) { impl_ldn_lkl_print(s, len, userdata); }
 
@@ -27,9 +90,12 @@ i32 ldn_lkl_load_firmware_cb(const char *name, void **dest, long long unsigned i
 }
 
 i32 ldn_lkl_init(void **ctx, void *userdata, const char *cmdline) {
-	lkl_host_ops.userdata =      userdata;
-	lkl_host_ops.print =         ldn_lkl_print_impl;
-	lkl_host_ops.load_firmware = ldn_lkl_load_firmware_cb;
+	lkl_host_ops.userdata =          userdata;
+	lkl_host_ops.print =             ldn_lkl_print_impl;
+	lkl_host_ops.load_firmware =     ldn_lkl_load_firmware_cb;
+	lkl_host_ops.timer_alloc =       ldn_timer_alloc;
+	lkl_host_ops.timer_set_oneshot = ldn_timer_set_oneshot;
+	lkl_host_ops.timer_free =        ldn_timer_free;
 
 	lkl_printf("Initialising");
 
